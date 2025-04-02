@@ -1836,11 +1836,13 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
         ellipsis_token_id=None,
         half_ellipsis_token_id=None,
         colon_token_id=None,
+        colon_new_line_token_id=None,
         line_break_token_id=None,
         stage1_max_new_tokens=10000,
         #stage1_max_length_for_each_step=5,
         stage2_max_new_tokens=10000,
         parallel_decoding_max_length=200,
+        return_parallel_info=False,
         **kwargs
     ):
 
@@ -1851,6 +1853,7 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
         #确保batchsize只能为1
         assert input_ids.size(0)==1,"batchsize must be 1"
 
+        import time
 
 
         logits_processor = CustomLogitsProcessor(para_end_token_id=para_end_token_id,
@@ -1858,6 +1861,7 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
                                                  line_break_token_id=line_break_token_id,
                                                  para_begin_token_id=para_begin_token_id,
                                                  colon_token_id=colon_token_id,
+                                                    colon_new_line_token_id=colon_new_line_token_id,
                                                  prefix_len=input_ids.size(1))
 
         #记录generate时间
@@ -1868,7 +1872,9 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
                                          max_new_tokens=stage1_max_new_tokens,
                                          return_dict_in_generate=True,
                                          **kwargs)
-        print("stage1 time:",time.time()-start_time)
+
+
+        stage1_time=time.time()-start_time
 
         past_key_values=output_stage1.past_key_values
         generated_sequence=output_stage1.sequences
@@ -1898,7 +1904,7 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
         #input_ids只保留para_begin_position之前部分
         stage2_input_ids=generated_sequence[:,:para_begin_position]
 
-        del output_stage1,past_key_values
+        del past_key_values
 
         #记录generate时间
         start_time=time.time()
@@ -1919,7 +1925,7 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
         colon_token_id=colon_token_id,
             **kwargs
         )
-        print("stage2 time:",time.time()-start_time)
+        stage2_time=time.time()-start_time
 
         #生成结果进行切片
         generated_output_para_each_beam=[generated_output_para[0][i::num_para].tolist() for i in range(num_para)]
@@ -1947,14 +1953,19 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
             cache_position=torch.arange(0,para_begin_position,device=input_ids.device),
             **kwargs
         )
-        print("stage3 time:",time.time()-start_time)
-        generated_output=generated_output.sequences
+        stage3_time=time.time()-start_time
+        generated_sequences=generated_output.sequences
 
         #将before_para_sequence，generated_output_para，generated_output拼接为一个完整的序列
         #generated_output_sequence=torch.cat([before_para_sequence,generated_output_para,generated_output],dim=1)
 
+        if not return_parallel_info:
+            return generated_sequences
 
-        return generated_output
+        else:
+            return {"final_output":generated_sequences,"stage1_output":output_stage1.sequences,"num_para":num_para,"para_begin_position":para_begin_position,
+                    "stage1_time":stage1_time,"stage2_time":stage2_time,"stage3_time":stage3_time}
+
 
 
     def generate_parallel(self,
@@ -1976,7 +1987,6 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
         #### 并行解码阶段，通常，必须输入past_key_values，且input_ids长度为1，即para_begin_token_id
         # from transformers import AutoTokenizer
         # tokenizer = AutoTokenizer.from_pretrained("/data/models/Qwen2.5-7B-Instruct")
-        print("num_para:",num_para)
         with torch.no_grad():
 
             # 使用bos_token_id初始化生成的序列
@@ -2420,12 +2430,13 @@ class Qwen2ForTokenClassification(Qwen2PreTrainedModel):
 from transformers import LogitsProcessor
 
 class CustomLogitsProcessor(LogitsProcessor):
-    def __init__(self, para_end_token_id, ellipsis_token_id, line_break_token_id, para_begin_token_id, colon_token_id,prefix_len):
+    def __init__(self, para_end_token_id, ellipsis_token_id, line_break_token_id, para_begin_token_id, colon_token_id,colon_new_line_token_id,prefix_len):
         self.para_end_token_id = para_end_token_id
         self.ellipsis_token_id = ellipsis_token_id
         self.line_break_token_id = line_break_token_id
         self.para_begin_token_id = para_begin_token_id
         self.colon_token_id = colon_token_id
+        self.colon_new_line_token_id=colon_new_line_token_id
         self.prefix_len=prefix_len
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
@@ -2450,6 +2461,11 @@ class CustomLogitsProcessor(LogitsProcessor):
 
         # 如果上一个token是colon_token_id，则next token 强制为ellipsis_token_id
         elif seq_length > 0 and input_ids[0, -1] == self.colon_token_id:
+            scores[:, :] = float('-inf')
+            scores[:, self.ellipsis_token_id] = 0
+
+        # 如果上一个token是colon_new_line_token_id，则next token 强制为line_break_token_id
+        elif seq_length > 0 and input_ids[0, -1] == self.colon_new_line_token_id:
             scores[:, :] = float('-inf')
             scores[:, self.ellipsis_token_id] = 0
 

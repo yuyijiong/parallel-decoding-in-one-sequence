@@ -7,11 +7,11 @@ we decode multiple tokens per step using a specialized attention mask, processin
 ![method](./method.png)
 
 
-## Run experiment
+## Run Decoding
 
 The experiment will run the same dataset with normal decoding and our parallel decoding method respectively, 
-and compare the output and decoding speed of them.
-The results will be saved in the `results` folder.
+and record the output and decoding speed of them.
+The results will be saved in the `results/{MODEL_NAME}` folder.
 
 ### Use Normal attention implementation
 
@@ -23,27 +23,37 @@ torch>=2.5.0
 
 To run our method with Qwen2 (or 2.5) models on the dataset of retrieval task
 ```bash
-python run.py --model_path <model_path> --task "retrieval"
+python generate.py --model_path <model_path> --task "retrieval"
 ```
 
 To run our method with Qwen2 (or 2.5) models on the dataset of multi-document QA
 ```bash
-python run.py --model_path <model_path> --task "multi-document-qa"
+python generate.py --model_path <model_path> --task "multi-document-qa"
 ```
+
+To run our method with Qwen2 (or 2.5) models on the dataset of multi-branch planning
+```bash
+python generate.py --model_path <model_path> --task "planning"
+```
+
 ### Use flash-attention-2
 
-First, install the flash-attention-2 package of our modified version
+First, install the flash-attention-2 package of our modified version. 
 ```bash
 cd flash-attention
 python setup.py install
 ```
 
-To run our method with Qwen2 (or 2.5) models on the dataset of retrieval task
+Then, run our method with Qwen2 (or 2.5) models on the dataset (such as the retrieval task) 
 ```bash
-python run.py --model_path <model_path> --task "retrieval" --attn_implementation "flash_attention_2"
+python generate.py --model_path <model_path> --task "retrieval" --attn_implementation "flash_attention_2"
 ```
 
-To run our method with Qwen2 (or 2.5) models on the dataset of multi-document QA
+## Run Evaluation
+
+To compare the answer quality, average inference time and the decoding speed of our method and the baseline, 
+you need to specify the dataset's path which records the output of the two methods in the `results/{MODEL_NAME}` folder, 
+and the task type of the dataset. You also need to provide your openai API key, and the model name.
 ```bash
-python run.py --model_path <model_path> --task "multi-document-qa" --attn_implementation "flash_attention_2"
+python eval.py --df_path <df_path> --task "retrieval" --api_key <api_key> --model_name "gpt-4o"
 ```
