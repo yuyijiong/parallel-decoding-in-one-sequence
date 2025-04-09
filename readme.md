@@ -6,6 +6,7 @@ we decode multiple tokens per step using a specialized attention mask, processin
 
 ![method](./method.png)
 
+[paper](https://arxiv.org/abs/2503.20533)
 
 ## Run Decoding
 
