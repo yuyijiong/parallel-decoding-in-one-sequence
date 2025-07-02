@@ -49,6 +49,7 @@ from transformers.utils import (
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 import time
 from transformers.generation.logits_process import LogitsProcessorList
+from transformers.generation import GenerationMixin
 
 if is_flash_attn_2_available():
     from modeling_flash_attention_utils import _flash_attention_forward
@@ -355,145 +356,6 @@ class Qwen2Attention(nn.Module):
 
         return attn_output, attn_weights, past_key_value
 
-
-class Qwen2ParaAttention(Qwen2Attention):
-
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        num_para=None,
-        para_begin_position=None,
-            **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
-        if num_para is None or para_begin_position is None:
-            #使用原来的forward
-            return super().forward(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, **kwargs)
-
-        else:
-            return self.parallel_forward(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, num_para, para_begin_position, **kwargs)
-
-
-    def parallel_forward(self,
-                         hidden_states: torch.Tensor,
-                         attention_mask: Optional[torch.Tensor] = None,
-                         position_ids: Optional[torch.LongTensor] = None,
-                         past_key_value: Optional[Cache] = None,
-                         output_attentions: bool = False,
-                         use_cache: bool = False,
-                         num_para=1,
-                         para_begin_position=0,
-                            **kwargs,
-                            ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
-        """
-        :param num_para: 每次并行输入的token数量
-        :param para_begin_position: 并行部分的第一个token的索引
-        :return:
-        """
-
-        #parallel模式下,hidden_states为 [bs,num_para*seq_len,hidden_size]。由于只发生于generate阶段，所以通常seq_len=1
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-
-            #计算长度时要除以num_para
-            #kv_seq_len += (past_key_value.get_usable_length(kv_seq_len, self.layer_idx) - para_begin_position)//num_para
-
-            kv_seq_len+=past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-
-            # #attention_mask中 最后num_para列的下三角部分设为 -65536
-            # rows, cols = attention_mask.shape
-            #
-            # # 创建一个下三角掩码（不包括对角线）
-            # mask = torch.tril(torch.ones(rows, num_para), diagonal=-1).bool()
-            #
-            # # 将掩码应用到第n列右边的区域
-            # attention_mask[:,:,:, -num_para:][mask] = -65536
-
-            attn_weights = attn_weights + attention_mask
-
-        #创建para_mask
-        para_mask = torch.zeros(bsz, 1, q_len, kv_seq_len, device=hidden_states.device,dtype=hidden_states.dtype)
-        #获取这一dtype的最小值
-        min_value = torch.finfo(hidden_states.dtype).min
-        #para_begin_position列之前部分不变。之后部分设为-65536
-        para_mask[:,:,:,para_begin_position:] = min_value
-        #将一些部分重新设为0
-        for i in range(num_para):
-            para_mask[:, :, i, para_begin_position+i::num_para] = 0
-
-        #apply
-        attn_weights = attn_weights + para_mask
-
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights,
 
 class Qwen2FlashAttention2(Qwen2Attention):
     """
@@ -1279,6 +1141,7 @@ class Qwen2ParaModel(Qwen2PreTrainedModel):
             else:
                 position_ids = cache_position.unsqueeze(0)
 
+        #将一维的attention mask转换为4维的causal mask
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions,num_para
         )
@@ -1843,6 +1706,7 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
         stage2_max_new_tokens=10000,
         parallel_decoding_max_length=200,
         return_parallel_info=False,
+                               debug=True,
         **kwargs
     ):
 
@@ -1877,15 +1741,31 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
         stage1_time=time.time()-start_time
 
         past_key_values=output_stage1.past_key_values
-        generated_sequence=output_stage1.sequences
+        stage1_sequence=output_stage1.sequences
+        stage1_generated_sequence=stage1_sequence[0, input_ids.size(1):]  # 截取生成的部分
 
-        #first_response=tokenizer.decode(generated_sequence[0].tolist()[input_ids.size(1):])
+
+        if debug:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.config.name_or_path)
+            stage1_response = tokenizer.decode(stage1_generated_sequence[0].tolist())
+            logger.debug(f"Stage 1 response: {stage1_response}")
 
         #在sequence中截取para_begin_token_id到para_end_token_id之间的部分
-        sequence_tolist=generated_sequence[0].tolist()
+        sequence_tolist=stage1_sequence[0].tolist()
         #prompt部分不需要查找
-        para_begin_position=sequence_tolist[input_ids.size(1):].index(para_begin_token_id)+input_ids.size(1) #首个####的位置
-        para_end_position=sequence_tolist[para_begin_position:].index(para_end_token_id)+para_begin_position # %%%%的位置
+        try:
+            para_begin_position=sequence_tolist[input_ids.size(1):].index(para_begin_token_id)+input_ids.size(1) #首个####的位置
+            para_end_position=sequence_tolist[para_begin_position:].index(para_end_token_id)+para_begin_position # %%%%的位置
+        except:
+            #如果没有找到para_begin_token_id或para_end_token_id，则返回原始的generated_sequence
+            logger.warning("No para_begin_token_id or para_end_token_id found in the generated outline. Returning the outline as the answer.")
+            if not return_parallel_info:
+                return stage1_sequence
+            else:
+                return {"final_output":stage1_sequence,"stage1_output":output_stage1.sequences,"num_para":0,"para_begin_position":0,
+                        "stage1_time":stage1_time,"stage2_time":0,"stage3_time":0}
+
         para_sequence=sequence_tolist[para_begin_position:para_end_position-1]
         #按para_each_beam_begin_token_id分割
         each_beam=split_list(para_sequence,para_begin_token_id)
@@ -1896,13 +1776,22 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
         num_para=len(each_beam)
 
 
-        #each_beam_decode=[tokenizer.decode(each_beam_i) for each_beam_i in each_beam]
+        if num_para==0:
+            #如果没有找到para_begin_token_id，则返回原始的generated_sequence
+            logger.warning("No para_begin_token_id found in the generated outline. Returning the outline as the answer.")
+            if not return_parallel_info:
+                return stage1_sequence
+            else:
+                return {"final_output":stage1_sequence,"stage1_output":output_stage1.sequences,"num_para":0,"para_begin_position":0,
+                        "stage1_time":stage1_time,"stage2_time":0,"stage3_time":0}
+
+
 
         #past_key_values只保留para_begin_position之前部分
         past_key_values_prefix=[(key_value[0][:,:,:para_begin_position],key_value[1][:,:,:para_begin_position]) for key_value in past_key_values]
         past_key_values_prefix=tuple(past_key_values_prefix)
         #input_ids只保留para_begin_position之前部分
-        stage2_input_ids=generated_sequence[:,:para_begin_position]
+        stage2_input_ids=stage1_sequence[:,:para_begin_position]
 
         del past_key_values
 
@@ -1929,41 +1818,56 @@ class Qwen2ForParaCausalLM(Qwen2PreTrainedModel):
 
         #生成结果进行切片
         generated_output_para_each_beam=[generated_output_para[0][i::num_para].tolist() for i in range(num_para)]
-        #每一个beam删除para_begin_token_id后面部分，第一个token不可删除
+        #每一个beam删除para_begin_token_id后面部分，第一个token不可删除。因为提早结束的beam会用 #### 进行填充。
         generated_output_para_each_beam=[[token for i,token in enumerate(beam) if token!=para_begin_token_id or i==0] for beam in generated_output_para_each_beam]
         #每一个beam前面加上 \n
         generated_output_para_each_beam=[[line_break_token_id]+beam for beam in generated_output_para_each_beam]
 
         #拼接为一个完整的序列
-        generated_output_para=stage2_input_ids[0].tolist()+[token for beam in generated_output_para_each_beam for token in beam]
+        # generated_output_para=stage2_input_ids[0].tolist()+[token for beam in generated_output_para_each_beam for token in beam]
+        #
+        # generated_output_para=torch.tensor([generated_output_para],device=input_ids.device)
 
-        generated_output_para=torch.tensor([generated_output_para],device=input_ids.device)
+        stage2_generated_sequences = [token for beam in generated_output_para_each_beam for token in beam] +[para_begin_token_id]+[para_end_token_id]
+        stage2_sequences = stage2_input_ids[0].tolist() + stage2_generated_sequences
+        stage2_generated_sequences = torch.tensor([stage2_generated_sequences], device=input_ids.device)
+        stage2_sequences = torch.tensor([stage2_sequences], device=input_ids.device)
 
-        #记录generate时间
+        stage2_output_len = stage2_generated_sequences.size(1)
+
+        if debug:
+            stage2_response = tokenizer.decode(stage2_generated_sequences[0].tolist())
+            logger.debug(f"Stage 2 response: {stage2_response}")
+
+        #记录stage3 generate时间
         start_time=time.time()
         #继续调用原模型的generate，直到生成eos_token_id
         generated_output=self.generate(
-            input_ids=generated_output_para,
+            input_ids=stage2_sequences,
             attention_mask=None,
             return_dict_in_generate=True,
             use_cache=use_cache,
-            eos_token_id=eos_token_id,
+            #eos_token_id=eos_token_id,
             max_new_tokens=stage2_max_new_tokens,
             past_key_values=past_key_values_prefix,
-            cache_position=torch.arange(0,para_begin_position,device=input_ids.device),
+            #cache_position=torch.arange(0,para_begin_position,device=input_ids.device),
             **kwargs
         )
-        stage3_time=time.time()-start_time
-        generated_sequences=generated_output.sequences
 
-        #将before_para_sequence，generated_output_para，generated_output拼接为一个完整的序列
-        #generated_output_sequence=torch.cat([before_para_sequence,generated_output_para,generated_output],dim=1)
+        stage3_sequences = generated_output.sequences
+        stage3_generated_sequences = stage3_sequences[:, stage2_sequences.size(1):]
+
+        stage3_time=time.time()-start_time
+
+        if debug:
+            stage3_response = tokenizer.decode(stage3_generated_sequences[0].tolist(),skip_special_tokens=False)
+            logger.info(f"Stage 3 response: {stage3_response}")
 
         if not return_parallel_info:
-            return generated_sequences
+            return stage3_sequences
 
         else:
-            return {"final_output":generated_sequences,"stage1_output":output_stage1.sequences,"num_para":num_para,"para_begin_position":para_begin_position,
+            return {"final_output":stage3_sequences,"stage1_output":stage1_sequence,"num_para":num_para,"para_begin_position":para_begin_position,
                     "stage1_time":stage1_time,"stage2_time":stage2_time,"stage3_time":stage3_time}
 
 

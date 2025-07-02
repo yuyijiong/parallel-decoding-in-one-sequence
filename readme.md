@@ -6,7 +6,6 @@ we decode multiple tokens per step using a specialized attention mask, processin
 
 ![method](./method.png)
 
-[paper](https://arxiv.org/abs/2503.20533)
 
 ## Run Decoding
 
@@ -18,7 +17,7 @@ The results will be saved in the `results/{MODEL_NAME}` folder.
 
 environment:
 ``
-transformers>=4.49.0
+transformers==4.47
 torch>=2.5.0
 ``
 
